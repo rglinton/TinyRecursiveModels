@@ -1,0 +1,94 @@
+from dataclasses import dataclass
+from typing import List, Dict, Any
+from .ops import Op, OpSpec, OPS_REGISTRY
+
+@dataclass
+class ProgramStep:
+    op_name: str
+    args: Dict[str, Any]  # already clamped to allowed ranges
+
+@dataclass
+class Program:
+    steps: List[ProgramStep]
+    MAX_LEN: int = 6
+
+    def __len__(self): return len(self.steps)
+    def append(self, step: ProgramStep):
+        if len(self.steps) >= self.MAX_LEN:
+            raise ValueError("Program length exceeds MAX_LEN")
+        self.steps.append(step)
+
+def mdl_features(p: Program, alpha: float = 0.2) -> Dict[str, float]:
+    """Simple MDL: length + alpha*param_count"""
+    length = len(p)
+    param_count = 0
+    base_cost = 0
+    for s in p.steps:
+        spec: OpSpec = OPS_REGISTRY[s.op_name]
+        base_cost += spec.base_cost
+        param_count += len(s.args)
+    mdls = {
+        "mdl_len": float(length),
+        "mdl_params": float(param_count),
+        "mdl_base_cost": float(base_cost),
+        "mdl_total": float(base_cost + length + alpha * param_count),
+    }
+    return mdls
+
+
+# dsl/program.py — helpers for MDL-ish features
+
+from typing import Dict
+from dsl.ops import OPS_REGISTRY
+
+def _is_noop_step(step) -> bool:
+    op = step.op_name
+    a: Dict[str, int] = step.args
+    if op == "translate":
+        return int(a.get("dx", 0)) == 0 and int(a.get("dy", 0)) == 0
+    if op == "color_map":
+        return int(a.get("src_color", -1)) == int(a.get("dst_color", -2))
+    if op == "copy":
+        sx, sy = int(a.get("src_x", -999)), int(a.get("src_y", -999))
+        dx, dy = int(a.get("dst_x", -999)), int(a.get("dst_y", -999))
+        w, h = int(a.get("w", 0)), int(a.get("h", 0))
+        return sx == dx and sy == dy and w > 0 and h > 0
+    return False
+
+
+def mdl_features(program) -> Dict[str, float]:
+    """
+    Produce a small set of MDL-ish features the EnergyHead uses.
+      - base_cost: sum of each step's declared base_cost (default 1.0 if absent)
+      - num_steps
+      - unique_ops
+      - consec_dupes: count of consecutive identical steps
+      - noop_steps: count of steps detected as obvious no-ops
+    """
+    steps = list(program.steps)
+    num_steps = float(len(steps))
+    unique_ops = len({s.op_name for s in steps})
+
+    # base_cost from op specs (fallback = 1.0)
+    base_cost = 0.0
+    for s in steps:
+        spec = OPS_REGISTRY.get(s.op_name, None)
+        base_cost += float(getattr(spec, "base_cost", 1.0)) if spec is not None else 1.0
+
+    # consecutive duplicates
+    consec_dupes = 0
+    for i in range(1, len(steps)):
+        a, b = steps[i - 1], steps[i]
+        if a.op_name == b.op_name and a.args == b.args:
+            consec_dupes += 1
+
+    # no-ops
+    noop_steps = sum(1 for s in steps if _is_noop_step(s))
+
+    return dict(
+        base_cost=base_cost,
+        num_steps=num_steps,
+        unique_ops=float(unique_ops),
+        consec_dupes=float(consec_dupes),
+        noop_steps=float(noop_steps),
+    )

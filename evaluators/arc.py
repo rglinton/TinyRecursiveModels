@@ -2,6 +2,7 @@ from typing import Dict, Sequence, Optional
 import os
 import json
 
+import random
 import torch
 import numpy as np
 from numba import njit
@@ -68,6 +69,10 @@ class ARC:
     
     def update_batch(self, batch: Dict[str, torch.Tensor], preds: Dict[str, torch.Tensor]):
         # Collect required outputs to CPU
+
+        #if random.random() > 0.01:  # Skip 99% of batches
+         #   return
+        
         outputs = {}
         q_values = None
 
@@ -75,7 +80,11 @@ class ARC:
             for k, v in collection.items():
                 if k in self.required_outputs:
                     if k == "q_halt_logits":
-                        q_values = v.to(torch.float64).sigmoid().cpu()
+                        # MPS doesn't support float64, use float32 instead
+                        if v.device.type == 'mps':
+                            q_values = v.to(torch.float32).sigmoid().cpu()
+                        else:
+                            q_values = v.to(torch.float64).sigmoid().cpu()
                     else:
                         outputs[k] = v.cpu()
                         
