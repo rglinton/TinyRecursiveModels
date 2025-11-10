@@ -2,167 +2,125 @@
 import argparse
 import json
 import os
-from pathlib import Path
 from typing import Optional
 
 import torch
-from torch.utils.data import DataLoader
+
+# === repo-local imports (from your repo) ===
 from puzzle_dataset import PuzzleDataset, PuzzleDatasetConfig
 
-# ---------------------------
-# Utilities
-# ---------------------------
-
-def _resolve_device() -> torch.device:
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    return torch.device("cpu")
-
-def _bool_test_mode(split: str) -> bool:
-    # Your dataset exposes a "test mode" flag rather than arbitrary split names.
-    # Treat anything not explicitly 'train' as test/val.
-    return split.lower() != "train"
-
-def _load_checkpoint(ckpt_path: Optional[str]):
-    if not ckpt_path:
-        return None
-    p = Path(ckpt_path)
-    if not p.exists():
-        print(f"[warn] checkpoint not found: {ckpt_path}")
-        return None
-    ckpt = torch.load(str(p), map_location="cpu")
-    print(f"loaded checkpoint: {ckpt_path}")
-    # Log top-level keys and subkeys to see what we actually saved during train
-    if isinstance(ckpt, dict):
-        print("[ckpt] top-level keys:", list(ckpt.keys()))
-        for k, v in ckpt.items():
-            if isinstance(v, dict):
-                print(f"[ckpt:{k}] subkeys: {list(v.keys())[:10]}{' ...' if len(v)>10 else ''}")
-            elif isinstance(v, (list, tuple)):
-                print(f"[ckpt:{k}] list/tuple len={len(v)}")
-            else:
-                print(f"[ckpt:{k}] type={type(v)}")
-    else:
-        print(f"[ckpt] unexpected type: {type(ckpt)}")
-    return ckpt
-
-def _open_log(log_json: Optional[str]):
-    if not log_json:
-        return None
-    Path(log_json).parent.mkdir(parents=True, exist_ok=True)
-    return open(log_json, "w", encoding="utf-8")
-
-# ---------------------------
-# Main evaluation (diagnostic)
-# ---------------------------
-
-@torch.no_grad()
-def evaluate(args):
-    device = _resolve_device()
-    print(f"device: {device.type}")
-
-    # ---------- Build dataset/loader exactly as your repo defines ----------
-    cfg = PuzzleDatasetConfig(
-        seed=42,
-        dataset_paths=[args.data_dir],          # list[str]
-        global_batch_size=int(args.batch_size), # dataset enforces global batch size
-        test_set_mode=_bool_test_mode(args.split),
-        epochs_per_iter=1,
-        rank=0,
-        num_replicas=1,
-    )
-    dataset = PuzzleDataset(cfg)
-
-    # IterableDataset: set batch_size=None so DataLoader yields exactly what __iter__ yields
-    loader = DataLoader(dataset, batch_size=None)
-
-    # ---------- Optional: peek at checkpoint structure (no model assumptions) ----------
-    ckpt = _load_checkpoint(args.ckpt_path)
-
-    # ---------- Iterate a few batches just to prove wiring + shape ----------
-    log_f = _open_log(args.log_json)
-    n_seen = 0
-    n_print = 5  # print first few to keep output readable
-
-    for item in loader:
-        # Per your dataset, each item is a triple: (set_name, batch, N_effective)
-        if not isinstance(item, (list, tuple)) or len(item) != 3:
-            print(f"[warn] unexpected item from dataset (type={type(item)}): {item}")
-            continue
-
-        set_name, batch, n_eff = item
-        # Respect requested split: dataset emits both train/test over time
-        # Only process the one the user asked for
-        want_test = _bool_test_mode(args.split)
-        is_test = (str(set_name).lower() != "train")
-        if want_test != is_test:
-            # Skip items from the other split
-            continue
-
-        # batch should be a dict with inputs/labels/puzzle_identifiers per your file
-        if not isinstance(batch, dict):
-            print(f"[warn] batch is not a dict (type={type(batch)}); skipping")
-            continue
-
-        x = batch.get("inputs", None)
-        y = batch.get("labels", None)
-        meta = batch.get("puzzle_identifiers", None)
-
-        # Move tensors to device when applicable; inputs/labels may be tensors or lists
-        def to_dev(t):
-            return t.to(device) if torch.is_tensor(t) else t
-
-        x = to_dev(x)
-        y = to_dev(y)
-
-        # Print concise diagnostics for first few batches
-        if n_seen < n_print:
-            def shape_of(t):
-                if torch.is_tensor(t):
-                    return list(t.shape)
-                if isinstance(t, (list, tuple)):
-                    return f"list_len={len(t)}"
-                return type(t).__name__
-
-            print(f"[{args.split}] N_eff={n_eff} x_shape={shape_of(x)} y_shape={shape_of(y)} "
-                  f"meta_keys={list(meta.keys()) if isinstance(meta, dict) else type(meta).__name__}")
-
-        # Optionally write a tiny JSONL row per batch (counts only)
-        if log_f:
-            row = {
-                "split": args.split,
-                "N_effective": int(n_eff) if isinstance(n_eff, (int, float)) else None,
-                "x_is_tensor": bool(torch.is_tensor(x)),
-                "y_is_tensor": bool(torch.is_tensor(y)),
-            }
-            log_f.write(json.dumps(row) + "\n")
-
-        n_seen += 1
-        if args.max_batches is not None and n_seen >= args.max_batches:
-            break
-
-    if log_f:
-        log_f.close()
-
-    print(f"[done] processed {n_seen} batch(es) for split='{args.split}'")
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--data_dir", required=True, help="Path to a single ARC-like dataset dir")
-    p.add_argument("--split", default="train", choices=["train", "val", "test"],
-                   help="Your dataset uses a test mode flag; 'val' aliases 'test'")
-    p.add_argument("--batch_size", type=int, default=32)
-    p.add_argument("--ckpt_path", type=str, default=None)
-    p.add_argument("--log_json", type=str, default=None)
-    p.add_argument("--max_batches", type=int, default=50,
-                   help="For quick diagnostics; set None to run all.")
+    p.add_argument("--data_dir", type=str, required=True, help="Path to ARC dataset directory (e.g., data/arc1concept-aug-1000)")
+    p.add_argument("--split", type=str, default="train", choices=["train", "val", "test"], help="Dataset split to iterate")
+    p.add_argument("--batch_size", type=int, default=32, help="Global batch size (PuzzleDatasetConfig.global_batch_size)")
+    p.add_argument("--ckpt_path", type=str, default="", help="Optional path to a checkpoint (.pt) to inspect")
+    p.add_argument("--log_json", type=str, default="", help="Optional path to a JSONL log file")
+    p.add_argument("--max_batches", type=int, default=5, help="Max batches to iterate before exiting")
+    p.add_argument("--seed", type=int, default=0, help="Seed used in PuzzleDatasetConfig")
     return p.parse_args()
 
-if __name__ == "__main__":
+
+def build_config(args) -> PuzzleDatasetConfig:
+    """
+    Construct the config object your PuzzleDataset actually expects.
+    These fields mirror the model in puzzle_dataset.py in your repo.
+    """
+    # Train mode = shuffle groups, Test mode = iterate examples in order.
+    test_mode = (args.split != "train")
+    cfg = PuzzleDatasetConfig(
+        seed=args.seed,
+        dataset_paths=[args.data_dir],      # IMPORTANT: list[str], not a single string
+        global_batch_size=args.batch_size,  # the dataset makes local_batch_size = global // num_replicas
+        test_set_mode=test_mode,
+        epochs_per_iter=1,                  # safe default; iteration-level internal batching
+        rank=0,                             # single-process eval
+        num_replicas=1                      # single-process eval
+    )
+    return cfg
+
+
+def maybe_open_jsonl(path: str) -> Optional[object]:
+    if not path:
+        return None
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    return open(path, "a", encoding="utf-8")
+
+
+def main():
     args = parse_args()
-    # Alias val->test for this dataset’s notion of test_set_mode
-    if args.split == "val":
-        args.split = "test"
-    evaluate(args)
+
+    device = torch.device(
+        "mps" if torch.backends.mps.is_available()
+        else ("cuda" if torch.cuda.is_available() else "cpu")
+    )
+    print(f"device: {device.type}")
+
+    # ---- Build dataset config & dataset (this matches your repo's expected API) ----
+    cfg = build_config(args)
+    ds = PuzzleDataset(config=cfg, split=args.split)
+
+    # A tiny peek at metadata that exists in your PuzzleDatasetMetadata
+    # (seq_len, vocab_size, etc. are defined in your repo; no guessing).
+    meta = ds.metadata
+    print(
+        f"[eval] split='{args.split}' | seq_len={meta.seq_len} | "
+        f"vocab_size={meta.vocab_size} | sets={list(meta.sets)} | "
+        f"mean_puzzle_examples={meta.mean_puzzle_examples:.2f}"
+    )
+
+    # ---- Optionally load & dump checkpoint keys (no model assumptions here) ----
+    if args.ckpt_path and os.path.isfile(args.ckpt_path):
+        ckpt = torch.load(args.ckpt_path, map_location="cpu")
+        print(f"loaded checkpoint: {args.ckpt_path}")
+        if isinstance(ckpt, dict):
+            print(f"[ckpt] top-level keys: {list(ckpt.keys())}")
+            for k in ckpt.keys():
+                sub = ckpt[k]
+                if isinstance(sub, dict):
+                    subkeys = list(sub.keys())
+                    # show a compact view
+                    head = ", ".join(subkeys[:8])
+                    tail = "" if len(subkeys) <= 8 else " ..."
+                    print(f"[ckpt:{k}] subkeys: [{head}]{tail}")
+        else:
+            print("[ckpt] unexpected checkpoint structure (not a dict)")
+
+    # ---- Iterate the dataset directly (it already yields ready-made batches) ----
+    out = maybe_open_jsonl(args.log_json)
+    total_effective = 0
+    batches = 0
+
+    try:
+        for (set_name, batch, effective_global_bs) in ds:
+            # batch is a dict with 'inputs', 'labels', 'puzzle_identifiers' (per your repo)
+            x = batch["inputs"].to(device)
+            y = batch["labels"].to(device)
+            ids = batch["puzzle_identifiers"].to(device)
+
+            info = {
+                "set": set_name,
+                "effective_batch_size": int(effective_global_bs),
+                "inputs": {"shape": list(x.shape), "dtype": str(x.dtype), "device": str(x.device)},
+                "labels": {"shape": list(y.shape), "dtype": str(y.dtype), "device": str(y.device)},
+                "puzzle_identifiers": {"shape": list(ids.shape), "dtype": str(ids.dtype), "device": str(ids.device)},
+            }
+            print(info)
+            if out is not None:
+                out.write(json.dumps(info) + "\n")
+
+            total_effective += int(effective_global_bs)
+            batches += 1
+            if batches >= args.max_batches:
+                break
+
+    finally:
+        if out is not None:
+            out.close()
+
+    print(f"[done] processed {batches} batch(es); total_effective={total_effective}")
+
+
+if __name__ == "__main__":
+    main()
