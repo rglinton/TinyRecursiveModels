@@ -1,231 +1,168 @@
-# evaluators/eval_coop_arc.py  (DROP-IN REPLACEMENT)
-
+#!/usr/bin/env python3
 import argparse
 import json
+import os
 from pathlib import Path
-from typing import Any, Dict, Tuple, List, Union
+from typing import Optional
 
 import torch
-import torch.nn as nn
 from torch.utils.data import DataLoader
+from puzzle_dataset import PuzzleDataset, PuzzleDatasetConfig
 
-# === Local repo imports (present in your repo) ===
-from puzzle_dataset import make_loaders  # your file
-from models.coop_heads import ProposerHead, CriticHead  # present in models/
-from models.energy_head import EnergyHead               # present in models/
-from dsl.executor import Executor                       # present in dsl/
+# ---------------------------
+# Utilities
+# ---------------------------
 
-# -------------------------------
-# Minimal encoder (to match ckpt)
-# -------------------------------
-class MinimalEncoder(nn.Module):
-    """
-    Small embedding-only encoder so the checkpoint's encoder block
-    (with key 'embed.weight' shaped [num_colors, 16]) can load.
-    It converts integer-color grids [B, H, W] -> [B, 16] by mean pooling
-    the embedded pixels. If your trained model used only the embedding
-    table, this will still load and run.
-    """
-    def __init__(self, num_embeddings: int, emb_dim: int = 16):
-        super().__init__()
-        self.embed = nn.Embedding(num_embeddings=num_embeddings, embedding_dim=emb_dim)
+def _resolve_device() -> torch.device:
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B, H, W] of integer color ids 0..num_embeddings-1
-        # -> [B, H, W, D] -> mean over H,W -> [B, D]
-        if x.dim() == 4 and x.size(1) == 1:
-            x = x.squeeze(1)  # [B, 1, H, W] -> [B, H, W]
-        em = self.embed(x.long())           # [B, H, W, D]
-        z = em.mean(dim=(1, 2))             # [B, D]
-        return z
+def _bool_test_mode(split: str) -> bool:
+    # Your dataset exposes a "test mode" flag rather than arbitrary split names.
+    # Treat anything not explicitly 'train' as test/val.
+    return split.lower() != "train"
 
-# -------------------------------
-# Batch unpacking helpers
-# -------------------------------
-def _to_device(t, device):
-    return t.to(device) if torch.is_tensor(t) else t
-
-def _unpack_dataset_batch(
-    raw_batch: Union[Tuple[Any, Dict[str, torch.Tensor], int], Dict[str, torch.Tensor]],
-    device: torch.device
-) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, Any]]:
-    """
-    Accepts either:
-      1) (set_name: str, batch: {'inputs': T, 'labels': T, 'puzzle_identifiers': T}, effective_bs: int)
-      2) batch: {'inputs': T, 'labels': T, 'puzzle_identifiers': T}
-    Returns:
-      x: [B, H, W], y: [B, H, W], info: dict with optional metadata
-    """
-    info: Dict[str, Any] = {}
-
-    # Case 1: tuple from your PuzzleDataset
-    if isinstance(raw_batch, (tuple, list)) and len(raw_batch) == 3 and isinstance(raw_batch[1], dict):
-        set_name, batch_dict, eff_bs = raw_batch
-        info["set_name"] = set_name
-        info["effective_bs"] = eff_bs
-        x = _to_device(batch_dict.get("inputs"), device)
-        y = _to_device(batch_dict.get("labels"), device)
-        info["puzzle_identifiers"] = _to_device(batch_dict.get("puzzle_identifiers"), device)
-        return x, y, info
-
-    # Case 2: plain dict
-    if isinstance(raw_batch, dict):
-        x = _to_device(raw_batch.get("inputs") or raw_batch.get("x"), device)
-        y = _to_device(raw_batch.get("labels") or raw_batch.get("y"), device)
-        if "puzzle_identifiers" in raw_batch:
-            info["puzzle_identifiers"] = _to_device(raw_batch["puzzle_identifiers"], device)
-        return x, y, info
-
-    raise TypeError(f"Unrecognized batch structure: type={type(raw_batch)}; expected (str, dict, int) or dict.")
-
-
-# -------------------------------
-# Loader construction wrapper
-# -------------------------------
-def _build_loader(
-    data_dir: str,
-    split: str,
-    batch_size: int
-) -> Tuple[DataLoader, Dict[str, Any]]:
-    """
-    Works with either return style:
-      A) make_loaders(...) -> {'train': loader, 'val': loader, ...}
-      B) make_loaders(...) -> (loader, metadata)  OR ( {'train': loader,...}, metadata )
-    """
-    # Try the simplest call signature first (your current make_loaders expects a string path)
-    res = make_loaders(data_dir, batch_size=batch_size)
-
-    # Normalize to (dict_of_loaders, metadata_dict)
-    meta: Dict[str, Any] = {}
-    if isinstance(res, dict):
-        loaders = res
-    elif isinstance(res, (tuple, list)):
-        if len(res) == 2 and isinstance(res[0], dict):
-            loaders, meta = res  # ({'train': ...}, metadata)
-        elif len(res) == 2 and isinstance(res[0], DataLoader):
-            # Single loader + meta, wrap into dict
-            single_loader, meta = res
-            # If we don't know the split, assume 'train'
-            loaders = {"train": single_loader}
-        else:
-            raise TypeError(f"Unexpected make_loaders return tuple: structure={tuple(type(x) for x in res)}")
+def _load_checkpoint(ckpt_path: Optional[str]):
+    if not ckpt_path:
+        return None
+    p = Path(ckpt_path)
+    if not p.exists():
+        print(f"[warn] checkpoint not found: {ckpt_path}")
+        return None
+    ckpt = torch.load(str(p), map_location="cpu")
+    print(f"loaded checkpoint: {ckpt_path}")
+    # Log top-level keys and subkeys to see what we actually saved during train
+    if isinstance(ckpt, dict):
+        print("[ckpt] top-level keys:", list(ckpt.keys()))
+        for k, v in ckpt.items():
+            if isinstance(v, dict):
+                print(f"[ckpt:{k}] subkeys: {list(v.keys())[:10]}{' ...' if len(v)>10 else ''}")
+            elif isinstance(v, (list, tuple)):
+                print(f"[ckpt:{k}] list/tuple len={len(v)}")
+            else:
+                print(f"[ckpt:{k}] type={type(v)}")
     else:
-        raise TypeError(f"Unexpected make_loaders return type: {type(res)}")
+        print(f"[ckpt] unexpected type: {type(ckpt)}")
+    return ckpt
 
-    if split not in loaders:
-        raise ValueError(f"Unknown split '{split}'. Available: {list(loaders.keys())}")
+def _open_log(log_json: Optional[str]):
+    if not log_json:
+        return None
+    Path(log_json).parent.mkdir(parents=True, exist_ok=True)
+    return open(log_json, "w", encoding="utf-8")
 
-    return loaders[split], meta
+# ---------------------------
+# Main evaluation (diagnostic)
+# ---------------------------
 
-
-# -------------------------------
-# Evaluation
-# -------------------------------
 @torch.no_grad()
 def evaluate(args):
-    device = torch.device(
-        "mps" if torch.backends.mps.is_available()
-        else ("cuda" if torch.cuda.is_available() else "cpu")
-    )
+    device = _resolve_device()
     print(f"device: {device.type}")
 
-    # ===== data =====
-    loader, meta = _build_loader(args.data_dir, args.split, args.batch_size)
-    print(f"[eval] split='{args.split}' -> loader.dataset={type(loader.dataset).__name__}")
+    # ---------- Build dataset/loader exactly as your repo defines ----------
+    cfg = PuzzleDatasetConfig(
+        seed=42,
+        dataset_paths=[args.data_dir],          # list[str]
+        global_batch_size=int(args.batch_size), # dataset enforces global batch size
+        test_set_mode=_bool_test_mode(args.split),
+        epochs_per_iter=1,
+        rank=0,
+        num_replicas=1,
+    )
+    dataset = PuzzleDataset(cfg)
 
-    # ===== models =====
-    # Minimal encoder defined above (fits checkpoint's 'embed.weight')
-    encoder = MinimalEncoder(num_embeddings=args.num_colors, emb_dim=16).to(device)
-    proposer = ProposerHead().to(device)
-    critic = CriticHead().to(device)
-    energy = EnergyHead().to(device)
-    execu = Executor()
+    # IterableDataset: set batch_size=None so DataLoader yields exactly what __iter__ yields
+    loader = DataLoader(dataset, batch_size=None)
 
-    # ===== load checkpoint =====
-    ckpt_path = Path(args.ckpt_path)
-    if not ckpt_path.exists():
-        raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
-    ckpt = torch.load(ckpt_path, map_location=device)
-    print(f"loaded checkpoint: {ckpt_path}")
+    # ---------- Optional: peek at checkpoint structure (no model assumptions) ----------
+    ckpt = _load_checkpoint(args.ckpt_path)
 
-    # Load safely; tolerate shape drift by using strict=False
-    if "encoder" in ckpt:
-        try:
-            encoder.load_state_dict(ckpt["encoder"], strict=False)
-        except Exception as e:
-            print(f"[warn] encoder.load_state_dict(strict=False) failed: {e}")
-    if "proposer" in ckpt:
-        try:
-            proposer.load_state_dict(ckpt["proposer"], strict=False)
-        except Exception as e:
-            print(f"[warn] proposer.load_state_dict(strict=False) failed: {e}")
-    if "critic" in ckpt:
-        try:
-            critic.load_state_dict(ckpt["critic"], strict=False)
-        except Exception as e:
-            print(f"[warn] critic.load_state_dict(strict=False) failed: {e}")
-    if "energy" in ckpt:
-        try:
-            energy.load_state_dict(ckpt["energy"], strict=False)
-        except Exception as e:
-            print(f"[warn] energy.load_state_dict(strict=False) failed: {e}")
+    # ---------- Iterate a few batches just to prove wiring + shape ----------
+    log_f = _open_log(args.log_json)
+    n_seen = 0
+    n_print = 5  # print first few to keep output readable
 
-    encoder.eval(); proposer.eval(); critic.eval(); energy.eval()
+    for item in loader:
+        # Per your dataset, each item is a triple: (set_name, batch, N_effective)
+        if not isinstance(item, (list, tuple)) or len(item) != 3:
+            print(f"[warn] unexpected item from dataset (type={type(item)}): {item}")
+            continue
 
-    # ===== loop =====
-    results: List[Dict[str, Any]] = []
-    for raw_batch in loader:
-        x, y_true, info = _unpack_dataset_batch(raw_batch, device)  # x,y: [B,H,W]
+        set_name, batch, n_eff = item
+        # Respect requested split: dataset emits both train/test over time
+        # Only process the one the user asked for
+        want_test = _bool_test_mode(args.split)
+        is_test = (str(set_name).lower() != "train")
+        if want_test != is_test:
+            # Skip items from the other split
+            continue
 
-        # Encode inputs
-        zA = encoder(x)  # [B, D]
+        # batch should be a dict with inputs/labels/puzzle_identifiers per your file
+        if not isinstance(batch, dict):
+            print(f"[warn] batch is not a dict (type={type(batch)}); skipping")
+            continue
 
-        # Cooperative heads propose and score a candidate program (toy stub: propose 1 step)
-        # Your real training used multi-step; here we keep it minimal for stability
-        msg_B = critic(zA)                 # critic message to proposer
-        prog_t = proposer(zA, msg_B)       # candidate program tokens/args
-        y_hat, trace = execu.run(prog_t, x, y_true, return_trace=True)
+        x = batch.get("inputs", None)
+        y = batch.get("labels", None)
+        meta = batch.get("puzzle_identifiers", None)
 
-        # Score with energy
-        mdl_features = lambda prog: torch.tensor([len(prog)], device=device, dtype=torch.float32).unsqueeze(0)
-        E_t = energy(mdl=mdl_features(prog_t), trace=trace, zA=zA, zB=msg_B)
+        # Move tensors to device when applicable; inputs/labels may be tensors or lists
+        def to_dev(t):
+            return t.to(device) if torch.is_tensor(t) else t
 
-        # Basic metrics (you can extend if you logged more in trace)
-        rec = (y_hat == y_true).float().mean().item()
+        x = to_dev(x)
+        y = to_dev(y)
 
-        results.append({
-            "set": info.get("set_name", args.split),
-            "recon_acc": rec,
-            "energy": float(E_t.mean().item()) if torch.is_tensor(E_t) else float(E_t),
-        })
+        # Print concise diagnostics for first few batches
+        if n_seen < n_print:
+            def shape_of(t):
+                if torch.is_tensor(t):
+                    return list(t.shape)
+                if isinstance(t, (list, tuple)):
+                    return f"list_len={len(t)}"
+                return type(t).__name__
 
-    # ===== write log (jsonl) =====
-    if args.log_json:
-        Path(args.log_json).parent.mkdir(parents=True, exist_ok=True)
-        with open(args.log_json, "w") as f:
-            for r in results:
-                f.write(json.dumps(r) + "\n")
+            print(f"[{args.split}] N_eff={n_eff} x_shape={shape_of(x)} y_shape={shape_of(y)} "
+                  f"meta_keys={list(meta.keys()) if isinstance(meta, dict) else type(meta).__name__}")
 
-    # quick summary
-    if results:
-        avg_rec = sum(r["recon_acc"] for r in results) / len(results)
-        avg_E = sum(r["energy"] for r in results) / len(results)
-        print(f"[summary] n={len(results)}  recon_acc={avg_rec:.4f}  energy={avg_E:.4f}")
-    else:
-        print("[summary] no batches produced by loader?")
+        # Optionally write a tiny JSONL row per batch (counts only)
+        if log_f:
+            row = {
+                "split": args.split,
+                "N_effective": int(n_eff) if isinstance(n_eff, (int, float)) else None,
+                "x_is_tensor": bool(torch.is_tensor(x)),
+                "y_is_tensor": bool(torch.is_tensor(y)),
+            }
+            log_f.write(json.dumps(row) + "\n")
+
+        n_seen += 1
+        if args.max_batches is not None and n_seen >= args.max_batches:
+            break
+
+    if log_f:
+        log_f.close()
+
+    print(f"[done] processed {n_seen} batch(es) for split='{args.split}'")
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--data_dir", type=str, required=True)
-    p.add_argument("--Tmax", type=int, default=6)
+    p.add_argument("--data_dir", required=True, help="Path to a single ARC-like dataset dir")
+    p.add_argument("--split", default="train", choices=["train", "val", "test"],
+                   help="Your dataset uses a test mode flag; 'val' aliases 'test'")
     p.add_argument("--batch_size", type=int, default=32)
-    p.add_argument("--ckpt_path", type=str, required=True)
-    p.add_argument("--split", type=str, default="val")  # 'train' also supported if that's all you have
-    p.add_argument("--log_json", type=str, default="")
-    p.add_argument("--num_colors", type=int, default=10)  # pass --num_colors 12 to match your ckpt
+    p.add_argument("--ckpt_path", type=str, default=None)
+    p.add_argument("--log_json", type=str, default=None)
+    p.add_argument("--max_batches", type=int, default=50,
+                   help="For quick diagnostics; set None to run all.")
     return p.parse_args()
 
 if __name__ == "__main__":
     args = parse_args()
-    with torch.inference_mode():
-        evaluate(args)
+    # Alias val->test for this dataset’s notion of test_set_mode
+    if args.split == "val":
+        args.split = "test"
+    evaluate(args)
