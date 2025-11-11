@@ -1,126 +1,327 @@
-#!/usr/bin/env python3
+# evaluators/eval_coop_arc.py
 import argparse
 import json
-import os
-from typing import Optional
+from pathlib import Path
 
 import torch
+from torch.utils.data import DataLoader
 
-# === repo-local imports (from your repo) ===
+# ---- Dataset (matches the working path you confirmed) ------------------------
+#from puzzle_dataset import PuzzleDataset
+from types import SimpleNamespace
 from puzzle_dataset import PuzzleDataset, PuzzleDatasetConfig
 
+# ---- Models (all from THIS repo) ---------------------------------------------
+from trainers.train_coop import MinimalEncoder          # <- actual training encoder
+from models.coop_heads import ProposerHead, CriticHead
+from models.energy_head import EnergyHead
+from dsl.executor import Executor
 
-def parse_args():
-    p = argparse.ArgumentParser()
-    p.add_argument("--data_dir", type=str, required=True, help="Path to ARC dataset directory (e.g., data/arc1concept-aug-1000)")
-    p.add_argument("--split", type=str, default="train", choices=["train", "val", "test"], help="Dataset split to iterate")
-    p.add_argument("--batch_size", type=int, default=32, help="Global batch size (PuzzleDatasetConfig.global_batch_size)")
-    p.add_argument("--ckpt_path", type=str, default="", help="Optional path to a checkpoint (.pt) to inspect")
-    p.add_argument("--log_json", type=str, default="", help="Optional path to a JSONL log file")
-    p.add_argument("--max_batches", type=int, default=5, help="Max batches to iterate before exiting")
-    p.add_argument("--seed", type=int, default=0, help="Seed used in PuzzleDatasetConfig")
-    return p.parse_args()
-
-
-def build_config(args) -> PuzzleDatasetConfig:
+def _unpack_batch(batch, device):
     """
-    Construct the config object your PuzzleDataset actually expects.
-    These fields mirror the model in puzzle_dataset.py in your repo.
+    Robustly extract (x, y, pid) from many possible batch layouts.
+    Handles:
+      - dict with keys like: x/inputs/X, y/labels/Y/target/targets, pid/puzzle_identifiers/id
+      - tuple/list: (x, y, pid) or (x, y)
+      - dicts with unknown keys: picks first 2-3 tensor-like values in a stable order
+    Moves tensors to device; converts numpy arrays to tensors first.
     """
-    # Train mode = shuffle groups, Test mode = iterate examples in order.
-    test_mode = (args.split != "train")
+    import numpy as np
+    import torch
+
+    def is_tensor_like(v):
+        return isinstance(v, torch.Tensor) or isinstance(v, np.ndarray)
+
+    def to_tensor(v):
+        if isinstance(v, np.ndarray):
+            return torch.from_numpy(v)
+        return v
+
+    x = y = pid = None
+
+    # --- Dict case: try known names first
+    if isinstance(batch, dict):
+        # Known names
+        x = batch.get("x") or batch.get("inputs") or batch.get("input") or batch.get("X")
+        y = (batch.get("y") or batch.get("labels") or batch.get("label")
+             or batch.get("target") or batch.get("targets") or batch.get("Y"))
+        pid = batch.get("pid") or batch.get("puzzle_identifiers") or batch.get("ids") or batch.get("id")
+
+        # Fallback: pick first few tensor-like values in key order if x/y missing
+        if x is None or y is None:
+            tensorish = []
+            for k in batch.keys():
+                v = batch[k]
+                if is_tensor_like(v):
+                    tensorish.append((k, v))
+            # Assign in order if present
+            if x is None and len(tensorish) >= 1:
+                x = tensorish[0][1]
+            if y is None and len(tensorish) >= 2:
+                y = tensorish[1][1]
+            if pid is None and len(tensorish) >= 3:
+                pid = tensorish[2][1]
+
+    # --- Tuple/List case
+    elif isinstance(batch, (list, tuple)):
+        if len(batch) >= 3:
+            x, y, pid = batch[0], batch[1], batch[2]
+        elif len(batch) == 2:
+            x, y = batch[0], batch[1]
+        elif len(batch) == 1:
+            x = batch[0]
+        else:
+            raise TypeError(f"Empty batch structure: {batch}")
+
+    else:
+        raise TypeError(f"Unrecognized batch type: {type(batch)}")
+
+    # Convert numpy -> torch and move to device
+    if x is not None:
+        x = to_tensor(x)
+        if hasattr(x, "to"):
+            x = x.to(device)
+    if y is not None:
+        y = to_tensor(y)
+        if hasattr(y, "to"):
+            y = y.to(device)
+    if pid is not None:
+        pid = to_tensor(pid)
+        if hasattr(pid, "to"):
+            pid = pid.to(device)
+
+    return x, y, pid
+
+def _unpack_batch_old(batch, device):
+    """
+    Accepts batches as dicts or tuples/lists and returns (x, y, pid) on the correct device.
+    - Dict: tries keys {'x'|'inputs'}, {'y'|'labels'}, {'pid'|'puzzle_identifiers'}.
+    - Tuple/List: accepts (x, y, pid) or (x, y).
+    """
+    import numpy as np
+    import torch
+
+    x = y = pid = None
+
+    if isinstance(batch, dict):
+        x = batch.get("x", batch.get("inputs"))
+        y = batch.get("y", batch.get("labels"))
+        pid = batch.get("pid", batch.get("puzzle_identifiers"))
+    elif isinstance(batch, (list, tuple)):
+        if len(batch) >= 3:
+            x, y, pid = batch[0], batch[1], batch[2]
+        elif len(batch) == 2:
+            x, y = batch[0], batch[1]
+        elif len(batch) == 1:
+            x = batch[0]
+        else:
+            raise TypeError(f"Empty batch structure: {batch}")
+    else:
+        raise TypeError(f"Unrecognized batch type: {type(batch)}")
+
+    # Convert numpy -> torch
+    if x is not None and isinstance(x, np.ndarray):
+        x = torch.from_numpy(x)
+    if y is not None and isinstance(y, np.ndarray):
+        y = torch.from_numpy(y)
+    if pid is not None and isinstance(pid, np.ndarray):
+        pid = torch.from_numpy(pid)
+
+    # Move to device (if tensors)
+    if hasattr(x, "to"):
+        x = x.to(device)
+    if hasattr(y, "to"):
+        y = y.to(device)
+    if hasattr(pid, "to"):
+        pid = pid.to(device)
+
+    return x, y, pid
+
+def _device():
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def _load_ckpt(path: str | Path):
+    ckpt = torch.load(path, map_location="cpu")
+    print(f"loaded checkpoint: {path}")
+    # Pretty-print the keys and a few subkeys
+    top = list(ckpt.keys())
+    print(f"[ckpt] top-level keys: {top}")
+    for k in ("encoder", "A", "B", "energy"):
+        if k in ckpt and isinstance(ckpt[k], dict):
+            sub = list(ckpt[k].keys())
+            if len(sub) > 8:
+                show = f"{', '.join(sub[:7])} ..."
+            else:
+                show = ", ".join(sub)
+            print(f"[ckpt:{k}] subkeys: [{show}]")
+    return ckpt
+
+def _build_loader(data_dir: str, split: str, batch_size: int):
+    """
+    Build a DataLoader using the PuzzleDatasetConfig expected by PuzzleDataset.
+    This version does NOT rely on cfg.num_colors and infers vocab size from the dataset.
+    """
+    # Build a minimal config matching your PuzzleDataset signature
     cfg = PuzzleDatasetConfig(
-        seed=args.seed,
-        dataset_paths=[args.data_dir],      # IMPORTANT: list[str], not a single string
-        global_batch_size=args.batch_size,  # the dataset makes local_batch_size = global // num_replicas
-        test_set_mode=test_mode,
-        epochs_per_iter=1,                  # safe default; iteration-level internal batching
-        rank=0,                             # single-process eval
-        num_replicas=1                      # single-process eval
+        dataset_paths=[data_dir],
+        seed=0,
+        global_batch_size=batch_size,
+        test_set_mode=False,
+        epochs_per_iter=1,
+        rank=0,
+        num_replicas=1,
     )
-    return cfg
+
+    # Instantiate dataset (your class reads what it needs from cfg)
+    ds = PuzzleDataset(cfg, split=split)
+
+    # Loader
+    dl = torch.utils.data.DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=0)
+
+    # --- Infer metadata robustly ---
+    seq_len = getattr(ds, "seq_len", 900)
+
+    vocab_size = None
+    # Try common attributes:
+    for attr in ("num_colors", "vocab_size"):
+        if hasattr(ds, attr):
+            vocab_size = getattr(ds, attr)
+            break
+    # Try palettes/collections:
+    if vocab_size is None:
+        for attr in ("palette", "colors", "color_vocab"):
+            if hasattr(ds, attr):
+                try:
+                    vocab_size = len(getattr(ds, attr))
+                    break
+                except Exception:
+                    pass
+    # Fallback
+    if vocab_size is None:
+        vocab_size = 12
+
+    meta = SimpleNamespace(
+        seq_len=seq_len,
+        vocab_size=vocab_size,
+        sets=["all"],
+    )
+    return dl, meta
 
 
-def maybe_open_jsonl(path: str) -> Optional[object]:
-    if not path:
-        return None
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    return open(path, "a", encoding="utf-8")
+def _build_models_from_ckpt(ckpt: dict, device: torch.device):
+    # Determine vocab size directly from the checkpoint so we match rows exactly.
+    if "encoder" not in ckpt or "embed.weight" not in ckpt["encoder"]:
+        raise RuntimeError("Checkpoint missing encoder/embed.weight; cannot size embeddings.")
+    num_embeddings = ckpt["encoder"]["embed.weight"].shape[0]
+
+    # MinimalEncoder from the ACTUAL training code
+    # d_model=256 matches your training config; padding_idx left None unless present in ckpt buffer names
+    encoder = MinimalEncoder(
+        num_embeddings=num_embeddings,
+        d_model=256,
+        padding_idx=None,
+    ).to(device)
+
+    proposer = ProposerHead().to(device)
+    critic = CriticHead().to(device)
+    energy = EnergyHead().to(device)
+    execu = Executor()  # pure python helper
+
+    # Load weights (non-strict only if necessary)
+    missing, unexpected = encoder.load_state_dict(ckpt["encoder"], strict=False)
+    if missing or unexpected:
+        print(f"[warn:encoder] missing={missing} unexpected={unexpected}")
+
+    if "A" in ckpt:
+        m, u = proposer.load_state_dict(ckpt["A"], strict=False)
+        if m or u:
+            print(f"[warn:A(ProposerHead)] missing={m} unexpected={u}")
+    if "B" in ckpt:
+        m, u = critic.load_state_dict(ckpt["B"], strict=False)
+        if m or u:
+            print(f"[warn:B(CriticHead)] missing={m} unexpected={u}")
+    if "energy" in ckpt:
+        m, u = energy.load_state_dict(ckpt["energy"], strict=False)
+        if m or u:
+            print(f"[warn:energy] missing={m} unexpected={u}")
+
+    # Report final sizes for sanity
+    emb = encoder.state_dict().get("embed.weight", None)
+    emb_rows = emb.shape[0] if emb is not None else None
+    print(f"[models] encoder.embed rows={emb_rows} (ckpt rows={num_embeddings})")
+
+    return encoder, proposer, critic, energy, execu
 
 
 def main():
-    args = parse_args()
+    p = argparse.ArgumentParser()
+    p.add_argument("--data_dir", type=str, required=True)
+    p.add_argument("--split", type=str, default="train")
+    p.add_argument("--batch_size", type=int, default=32)
+    p.add_argument("--ckpt_path", type=str, required=True)
+    p.add_argument("--log_json", type=str, default=None)
+    p.add_argument("--max_batches", type=int, default=5)
+    args = p.parse_args()
 
-    device = torch.device(
-        "mps" if torch.backends.mps.is_available()
-        else ("cuda" if torch.cuda.is_available() else "cpu")
-    )
+    device = _device()
     print(f"device: {device.type}")
 
-    # ---- Build dataset config & dataset (this matches your repo's expected API) ----
-    cfg = build_config(args)
-    ds = PuzzleDataset(config=cfg, split=args.split)
+    # Data
+    loader, meta = _build_loader(args.data_dir, args.split, args.batch_size)
 
-    # A tiny peek at metadata that exists in your PuzzleDatasetMetadata
-    # (seq_len, vocab_size, etc. are defined in your repo; no guessing).
-    meta = ds.metadata
-    print(
-        f"[eval] split='{args.split}' | seq_len={meta.seq_len} | "
-        f"vocab_size={meta.vocab_size} | sets={list(meta.sets)} | "
-        f"mean_puzzle_examples={meta.mean_puzzle_examples:.2f}"
-    )
+    # Checkpoint & models (built from ACTUAL training encoder)
+    ckpt = _load_ckpt(args.ckpt_path)
+    encoder, proposer, critic, energy, execu = _build_models_from_ckpt(ckpt, device)
 
-    # ---- Optionally load & dump checkpoint keys (no model assumptions here) ----
-    if args.ckpt_path and os.path.isfile(args.ckpt_path):
-        ckpt = torch.load(args.ckpt_path, map_location="cpu")
-        print(f"loaded checkpoint: {args.ckpt_path}")
-        if isinstance(ckpt, dict):
-            print(f"[ckpt] top-level keys: {list(ckpt.keys())}")
-            for k in ckpt.keys():
-                sub = ckpt[k]
-                if isinstance(sub, dict):
-                    subkeys = list(sub.keys())
-                    # show a compact view
-                    head = ", ".join(subkeys[:8])
-                    tail = "" if len(subkeys) <= 8 else " ..."
-                    print(f"[ckpt:{k}] subkeys: [{head}]{tail}")
-        else:
-            print("[ckpt] unexpected checkpoint structure (not a dict)")
+    # Iterate a few batches to confirm shapes & readiness (no forward pass)
+    processed = 0
 
-    # ---- Iterate the dataset directly (it already yields ready-made batches) ----
-    out = maybe_open_jsonl(args.log_json)
-    total_effective = 0
-    batches = 0
+    for i, batch in enumerate(loader):
+        x, y_true, pid = _unpack_batch(batch, device)
 
-    try:
-        for (set_name, batch, effective_global_bs) in ds:
-            # batch is a dict with 'inputs', 'labels', 'puzzle_identifiers' (per your repo)
-            x = batch["inputs"].to(device)
-            y = batch["labels"].to(device)
-            ids = batch["puzzle_identifiers"].to(device)
+        # Optional: print a tiny summary the first few batches
+        if i < 3:
+            def shape_of(t):
+                try:
+                    return list(t.shape)
+                except Exception:
+                    return None
+            print({
+                "set": "all",
+                "effective_batch_size": (x.shape[0] if hasattr(x, "shape") else None),
+                "inputs": {"shape": shape_of(x), "dtype": str(getattr(x, "dtype", None)), "device": str(getattr(x, "device", None))},
+                "labels": {"shape": shape_of(y_true), "dtype": str(getattr(y_true, "dtype", None)), "device": str(getattr(y_true, "device", None))},
+                "puzzle_identifiers": {"shape": shape_of(pid), "dtype": str(getattr(pid, "dtype", None)), "device": str(getattr(pid, "device", None))},
+            })
 
-            info = {
-                "set": set_name,
-                "effective_batch_size": int(effective_global_bs),
-                "inputs": {"shape": list(x.shape), "dtype": str(x.dtype), "device": str(x.device)},
-                "labels": {"shape": list(y.shape), "dtype": str(y.dtype), "device": str(y.device)},
-                "puzzle_identifiers": {"shape": list(ids.shape), "dtype": str(ids.dtype), "device": str(ids.device)},
-            }
-            print(info)
-            if out is not None:
-                out.write(json.dumps(info) + "\n")
+        # If you’re not actually computing anything yet, just count batches
+        processed += (x.shape[0] if hasattr(x, "shape") else 0)
 
-            total_effective += int(effective_global_bs)
-            batches += 1
-            if batches >= args.max_batches:
-                break
+        if args.max_batches is not None and (i + 1) >= args.max_batches:
+            break
 
-    finally:
-        if out is not None:
-            out.close()
+    print(f"[done] processed {i+1} batch(es); total_effective={processed}")
 
-    print(f"[done] processed {batches} batch(es); total_effective={total_effective}")
 
+    # Optional logging
+    # ---- Summary / logging (dot access for SimpleNamespace) ----
+    seq_len = getattr(meta, "seq_len", None)
+    vocab_size = getattr(meta, "vocab_size", None)
+    sets = getattr(meta, "sets", None)
+    mean_puzzle_examples = getattr(meta, "mean_puzzle_examples", None)
+
+    summary_hdr = {
+        "set": sets if sets is not None else "unknown",
+        "effective_batch_size": effective_bs if 'effective_bs' in locals() else None,
+        "seq_len": seq_len,
+        "vocab_size": vocab_size,
+        "mean_puzzle_examples": mean_puzzle_examples,
+    }
+    print(summary_hdr)
+    
 
 if __name__ == "__main__":
     main()
