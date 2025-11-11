@@ -1,327 +1,174 @@
 # evaluators/eval_coop_arc.py
-import argparse
-import json
-from pathlib import Path
+import argparse, json, math, os, sys
+from types import SimpleNamespace
 
 import torch
-from torch.utils.data import DataLoader
+from torch import nn
 
-# ---- Dataset (matches the working path you confirmed) ------------------------
-#from puzzle_dataset import PuzzleDataset
-from types import SimpleNamespace
-from puzzle_dataset import PuzzleDataset, PuzzleDatasetConfig
-
-# ---- Models (all from THIS repo) ---------------------------------------------
-from trainers.train_coop import MinimalEncoder          # <- actual training encoder
+# Repo-local imports (match your tree)
+from puzzle_dataset import PuzzleDataset
 from models.coop_heads import ProposerHead, CriticHead
 from models.energy_head import EnergyHead
 from dsl.executor import Executor
+# Use the SAME encoder class that was used for training
+from trainers.train_coop import MinimalEncoder
 
-def _unpack_batch(batch, device):
+
+def _tensorize_square_from_seq(seq_tensor: torch.Tensor, device: torch.device) -> torch.Tensor:
     """
-    Robustly extract (x, y, pid) from many possible batch layouts.
-    Handles:
-      - dict with keys like: x/inputs/X, y/labels/Y/target/targets, pid/puzzle_identifiers/id
-      - tuple/list: (x, y, pid) or (x, y)
-      - dicts with unknown keys: picks first 2-3 tensor-like values in a stable order
-    Moves tensors to device; converts numpy arrays to tensors first.
+    seq_tensor: [B, L] integers
+    returns: [B, H, W] with H*W = L, or raises if not square.
     """
-    import numpy as np
-    import torch
+    if not torch.is_tensor(seq_tensor):
+        seq_tensor = torch.as_tensor(seq_tensor)
+    seq_tensor = seq_tensor.to(device).long()
+    if seq_tensor.dim() == 1:
+        seq_tensor = seq_tensor.unsqueeze(0)  # [1, L]
+    assert seq_tensor.dim() == 2, f"expected [B, L], got {list(seq_tensor.shape)}"
+    B, L = seq_tensor.shape
+    side = int(round(math.sqrt(L)))
+    if side * side != L:
+        raise ValueError(f"Cannot reshape L={L} into square grid")
+    return seq_tensor.view(B, side, side)
 
-    def is_tensor_like(v):
-        return isinstance(v, torch.Tensor) or isinstance(v, np.ndarray)
 
-    def to_tensor(v):
-        if isinstance(v, np.ndarray):
-            return torch.from_numpy(v)
-        return v
+def _iter_puzzle_batches(ds, device, max_batches=None):
+    """
+    Your PuzzleDataset yields (set_name: str, batch_dict: dict, effective_bs: int|None).
+    We do NOT wrap it in a DataLoader — it’s already batched.
+    Yields (x:[B,H,W], y:[B,H,W], set_name:str, effective_bs:int|None).
+    """
+    seen = 0
+    for item in ds:
+        # Expect exactly 3-tuple
+        if not (isinstance(item, (tuple, list)) and len(item) == 3 and isinstance(item[1], dict)):
+            # Skip anything malformed
+            continue
 
-    x = y = pid = None
-
-    # --- Dict case: try known names first
-    if isinstance(batch, dict):
-        # Known names
-        x = batch.get("x") or batch.get("inputs") or batch.get("input") or batch.get("X")
-        y = (batch.get("y") or batch.get("labels") or batch.get("label")
-             or batch.get("target") or batch.get("targets") or batch.get("Y"))
-        pid = batch.get("pid") or batch.get("puzzle_identifiers") or batch.get("ids") or batch.get("id")
-
-        # Fallback: pick first few tensor-like values in key order if x/y missing
-        if x is None or y is None:
-            tensorish = []
-            for k in batch.keys():
-                v = batch[k]
-                if is_tensor_like(v):
-                    tensorish.append((k, v))
-            # Assign in order if present
-            if x is None and len(tensorish) >= 1:
-                x = tensorish[0][1]
-            if y is None and len(tensorish) >= 2:
-                y = tensorish[1][1]
-            if pid is None and len(tensorish) >= 3:
-                pid = tensorish[2][1]
-
-    # --- Tuple/List case
-    elif isinstance(batch, (list, tuple)):
-        if len(batch) >= 3:
-            x, y, pid = batch[0], batch[1], batch[2]
-        elif len(batch) == 2:
-            x, y = batch[0], batch[1]
-        elif len(batch) == 1:
-            x = batch[0]
+        set_name, bdict, eff = item
+        if "inputs" in bdict and "labels" in bdict:
+            x = _tensorize_square_from_seq(bdict["inputs"], device)
+            y = _tensorize_square_from_seq(bdict["labels"], device)
+        elif "x" in bdict and "y" in bdict:
+            x = torch.as_tensor(bdict["x"], device=device).long()
+            y = torch.as_tensor(bdict["y"], device=device).long()
         else:
-            raise TypeError(f"Empty batch structure: {batch}")
+            # No usable keys; skip
+            continue
 
-    else:
-        raise TypeError(f"Unrecognized batch type: {type(batch)}")
-
-    # Convert numpy -> torch and move to device
-    if x is not None:
-        x = to_tensor(x)
-        if hasattr(x, "to"):
-            x = x.to(device)
-    if y is not None:
-        y = to_tensor(y)
-        if hasattr(y, "to"):
-            y = y.to(device)
-    if pid is not None:
-        pid = to_tensor(pid)
-        if hasattr(pid, "to"):
-            pid = pid.to(device)
-
-    return x, y, pid
-
-def _unpack_batch_old(batch, device):
-    """
-    Accepts batches as dicts or tuples/lists and returns (x, y, pid) on the correct device.
-    - Dict: tries keys {'x'|'inputs'}, {'y'|'labels'}, {'pid'|'puzzle_identifiers'}.
-    - Tuple/List: accepts (x, y, pid) or (x, y).
-    """
-    import numpy as np
-    import torch
-
-    x = y = pid = None
-
-    if isinstance(batch, dict):
-        x = batch.get("x", batch.get("inputs"))
-        y = batch.get("y", batch.get("labels"))
-        pid = batch.get("pid", batch.get("puzzle_identifiers"))
-    elif isinstance(batch, (list, tuple)):
-        if len(batch) >= 3:
-            x, y, pid = batch[0], batch[1], batch[2]
-        elif len(batch) == 2:
-            x, y = batch[0], batch[1]
-        elif len(batch) == 1:
-            x = batch[0]
-        else:
-            raise TypeError(f"Empty batch structure: {batch}")
-    else:
-        raise TypeError(f"Unrecognized batch type: {type(batch)}")
-
-    # Convert numpy -> torch
-    if x is not None and isinstance(x, np.ndarray):
-        x = torch.from_numpy(x)
-    if y is not None and isinstance(y, np.ndarray):
-        y = torch.from_numpy(y)
-    if pid is not None and isinstance(pid, np.ndarray):
-        pid = torch.from_numpy(pid)
-
-    # Move to device (if tensors)
-    if hasattr(x, "to"):
-        x = x.to(device)
-    if hasattr(y, "to"):
-        y = y.to(device)
-    if hasattr(pid, "to"):
-        pid = pid.to(device)
-
-    return x, y, pid
-
-def _device():
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        yield x, y, set_name, eff
+        seen += 1
+        if max_batches is not None and seen >= max_batches:
+            break
 
 
-def _load_ckpt(path: str | Path):
-    ckpt = torch.load(path, map_location="cpu")
-    print(f"loaded checkpoint: {path}")
-    # Pretty-print the keys and a few subkeys
-    top = list(ckpt.keys())
-    print(f"[ckpt] top-level keys: {top}")
-    for k in ("encoder", "A", "B", "energy"):
-        if k in ckpt and isinstance(ckpt[k], dict):
-            sub = list(ckpt[k].keys())
-            if len(sub) > 8:
-                show = f"{', '.join(sub[:7])} ..."
-            else:
-                show = ", ".join(sub)
-            print(f"[ckpt:{k}] subkeys: [{show}]")
-    return ckpt
+@torch.no_grad()
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--data_dir", required=True)
+    p.add_argument("--split", default="train", choices=["train", "val", "test", "all"])
+    p.add_argument("--batch_size", type=int, default=32)  # not used (already batched), kept for CLI parity
+    p.add_argument("--ckpt_path", required=True)
+    p.add_argument("--log_json", default=None)
+    p.add_argument("--max_batches", type=int, default=5)
+    args = p.parse_args()
 
-def _build_loader(data_dir: str, split: str, batch_size: int):
-    """
-    Build a DataLoader using the PuzzleDatasetConfig expected by PuzzleDataset.
-    This version does NOT rely on cfg.num_colors and infers vocab size from the dataset.
-    """
-    # Build a minimal config matching your PuzzleDataset signature
+    device = torch.device(
+        "mps" if torch.backends.mps.is_available()
+        else ("cuda" if torch.cuda.is_available() else "cpu")
+    )
+    print(f"device: {device.type}")
+
+    # ==== Dataset (iterable, already batched) ====
+
+    from puzzle_dataset import PuzzleDatasetConfig  # add near other imports if not present
+
     cfg = PuzzleDatasetConfig(
-        dataset_paths=[data_dir],
+        dataset_paths=[args.data_dir],
         seed=0,
-        global_batch_size=batch_size,
-        test_set_mode=False,
+        global_batch_size=args.batch_size,
+        test_set_mode=False,   # must be a bool
         epochs_per_iter=1,
         rank=0,
         num_replicas=1,
     )
 
-    # Instantiate dataset (your class reads what it needs from cfg)
-    ds = PuzzleDataset(cfg, split=split)
-
-    # Loader
-    dl = torch.utils.data.DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=0)
-
-    # --- Infer metadata robustly ---
-    seq_len = getattr(ds, "seq_len", 900)
-
-    vocab_size = None
-    # Try common attributes:
-    for attr in ("num_colors", "vocab_size"):
-        if hasattr(ds, attr):
-            vocab_size = getattr(ds, attr)
-            break
-    # Try palettes/collections:
-    if vocab_size is None:
-        for attr in ("palette", "colors", "color_vocab"):
-            if hasattr(ds, attr):
-                try:
-                    vocab_size = len(getattr(ds, attr))
-                    break
-                except Exception:
-                    pass
-    # Fallback
-    if vocab_size is None:
-        vocab_size = 12
-
-    meta = SimpleNamespace(
-        seq_len=seq_len,
-        vocab_size=vocab_size,
-        sets=["all"],
-    )
-    return dl, meta
+    ds = PuzzleDataset(cfg, split=args.split)  # pass the config object (positional), not a string
 
 
-def _build_models_from_ckpt(ckpt: dict, device: torch.device):
-    # Determine vocab size directly from the checkpoint so we match rows exactly.
-    if "encoder" not in ckpt or "embed.weight" not in ckpt["encoder"]:
-        raise RuntimeError("Checkpoint missing encoder/embed.weight; cannot size embeddings.")
-    num_embeddings = ckpt["encoder"]["embed.weight"].shape[0]
+    # Try to read these if exposed; fall back to sensible defaults
+    vocab_size = getattr(ds, "num_colors", 12)
+    seq_len = getattr(ds, "seq_len", None)  # may not exist; purely informational
+    sets = getattr(ds, "sets", ["all"])
+    mean_examples = getattr(ds, "mean_puzzle_examples", None)
 
-    # MinimalEncoder from the ACTUAL training code
-    # d_model=256 matches your training config; padding_idx left None unless present in ckpt buffer names
-    encoder = MinimalEncoder(
-        num_embeddings=num_embeddings,
-        d_model=256,
-        padding_idx=None,
-    ).to(device)
+    print(f"[eval] split='{args.split}' | seq_len={seq_len} | vocab_size={vocab_size} | sets={sets} | mean_puzzle_examples={mean_examples}")
 
-    proposer = ProposerHead().to(device)
-    critic = CriticHead().to(device)
+    # ==== Models (match training) ====
+    encoder = MinimalEncoder(num_embeddings=vocab_size, d_model=256, padding_idx=None).to(device)
+    A = ProposerHead().to(device)
+    B = CriticHead().to(device)
     energy = EnergyHead().to(device)
-    execu = Executor()  # pure python helper
+    execu = Executor()
 
-    # Load weights (non-strict only if necessary)
-    missing, unexpected = encoder.load_state_dict(ckpt["encoder"], strict=False)
-    if missing or unexpected:
-        print(f"[warn:encoder] missing={missing} unexpected={unexpected}")
+    # ==== Load checkpoint ====
+    ckpt = torch.load(args.ckpt_path, map_location=device)
+    print("loaded checkpoint:", args.ckpt_path)
+    print("[ckpt] top-level keys:", list(ckpt.keys()))
+    for k in ["encoder", "A", "B", "energy"]:
+        if k in ckpt:
+            sub = ckpt[k]
+            # print up to ~8 subkeys for readability
+            subkeys = list(sub.keys())
+            head = ", ".join(subkeys[:8]) + (" ..." if len(subkeys) > 8 else "")
+            print(f"[ckpt:{k}] subkeys: [{head}]")
+        else:
+            print(f"[ckpt:{k}] MISSING")
 
-    if "A" in ckpt:
-        m, u = proposer.load_state_dict(ckpt["A"], strict=False)
-        if m or u:
-            print(f"[warn:A(ProposerHead)] missing={m} unexpected={u}")
-    if "B" in ckpt:
-        m, u = critic.load_state_dict(ckpt["B"], strict=False)
-        if m or u:
-            print(f"[warn:B(CriticHead)] missing={m} unexpected={u}")
-    if "energy" in ckpt:
-        m, u = energy.load_state_dict(ckpt["energy"], strict=False)
-        if m or u:
-            print(f"[warn:energy] missing={m} unexpected={u}")
+    # Strict=False so minor cosmetic diffs don’t crash loading
+    encoder.load_state_dict(ckpt.get("encoder", {}), strict=False)
+    A.load_state_dict(ckpt.get("A", {}), strict=False)
+    B.load_state_dict(ckpt.get("B", {}), strict=False)
+    energy.load_state_dict(ckpt.get("energy", {}), strict=False)
 
-    # Report final sizes for sanity
-    emb = encoder.state_dict().get("embed.weight", None)
-    emb_rows = emb.shape[0] if emb is not None else None
-    print(f"[models] encoder.embed rows={emb_rows} (ckpt rows={num_embeddings})")
+    print(f"[models] encoder.embed rows={encoder.embed.weight.shape[0]} (ckpt rows={ckpt.get('encoder',{}).get('embed.weight', torch.empty(0)).shape[0] if 'encoder' in ckpt else 'n/a'})")
 
-    return encoder, proposer, critic, energy, execu
-
-
-def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--data_dir", type=str, required=True)
-    p.add_argument("--split", type=str, default="train")
-    p.add_argument("--batch_size", type=int, default=32)
-    p.add_argument("--ckpt_path", type=str, required=True)
-    p.add_argument("--log_json", type=str, default=None)
-    p.add_argument("--max_batches", type=int, default=5)
-    args = p.parse_args()
-
-    device = _device()
-    print(f"device: {device.type}")
-
-    # Data
-    loader, meta = _build_loader(args.data_dir, args.split, args.batch_size)
-
-    # Checkpoint & models (built from ACTUAL training encoder)
-    ckpt = _load_ckpt(args.ckpt_path)
-    encoder, proposer, critic, energy, execu = _build_models_from_ckpt(ckpt, device)
-
-    # Iterate a few batches to confirm shapes & readiness (no forward pass)
+    # ==== Iterate a few batches and print real shapes ====
     processed = 0
-
-    for i, batch in enumerate(loader):
-        x, y_true, pid = _unpack_batch(batch, device)
-
-        # Optional: print a tiny summary the first few batches
-        if i < 3:
-            def shape_of(t):
-                try:
-                    return list(t.shape)
-                except Exception:
-                    return None
+    for x, y, set_name, eff in _iter_puzzle_batches(ds, device, max_batches=args.max_batches):
+        if processed < 3:
             print({
-                "set": "all",
-                "effective_batch_size": (x.shape[0] if hasattr(x, "shape") else None),
-                "inputs": {"shape": shape_of(x), "dtype": str(getattr(x, "dtype", None)), "device": str(getattr(x, "device", None))},
-                "labels": {"shape": shape_of(y_true), "dtype": str(getattr(y_true, "dtype", None)), "device": str(getattr(y_true, "device", None))},
-                "puzzle_identifiers": {"shape": shape_of(pid), "dtype": str(getattr(pid, "dtype", None)), "device": str(getattr(pid, "device", None))},
+                "set": set_name,
+                "effective_batch_size": eff,
+                "inputs": {"shape": list(x.shape), "dtype": str(x.dtype), "device": str(x.device)},
+                "labels": {"shape": list(y.shape), "dtype": str(y.dtype), "device": str(y.device)},
             })
 
-        # If you’re not actually computing anything yet, just count batches
-        processed += (x.shape[0] if hasattr(x, "shape") else 0)
+        # If you want to run a single proposer step + energy:
+        # z = encoder(x)  # [B, H, W, d] internally per your MinimalEncoder
+        # step, zA = A(z, prev_program=None, msg_from_B=None)
+        # _, trace = execu.run(step, x, y, return_trace=True)
+        # E = energy(mdl=None, trace=trace, zA=zA, zB=None)
 
-        if args.max_batches is not None and (i + 1) >= args.max_batches:
-            break
+        processed += 1
 
-    print(f"[done] processed {i+1} batch(es); total_effective={processed}")
+    print(f"[done] processed {processed} batch(es)")
 
+    # Optional: tiny summary log
+    if args.log_json:
+        summary = {
+            "set": list(sets),
+            "effective_batch_size": None,
+            "seq_len": seq_len,
+            "vocab_size": vocab_size,
+            "mean_puzzle_examples": mean_examples,
+        }
+        os.makedirs(os.path.dirname(args.log_json), exist_ok=True)
+        with open(args.log_json, "a") as f:
+            f.write(json.dumps(summary) + "\n")
+        print(summary)
 
-    # Optional logging
-    # ---- Summary / logging (dot access for SimpleNamespace) ----
-    seq_len = getattr(meta, "seq_len", None)
-    vocab_size = getattr(meta, "vocab_size", None)
-    sets = getattr(meta, "sets", None)
-    mean_puzzle_examples = getattr(meta, "mean_puzzle_examples", None)
-
-    summary_hdr = {
-        "set": sets if sets is not None else "unknown",
-        "effective_batch_size": effective_bs if 'effective_bs' in locals() else None,
-        "seq_len": seq_len,
-        "vocab_size": vocab_size,
-        "mean_puzzle_examples": mean_puzzle_examples,
-    }
-    print(summary_hdr)
-    
 
 if __name__ == "__main__":
     main()
+
